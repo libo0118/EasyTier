@@ -586,6 +586,28 @@ async fn data_plane_udp_pingpong() {
 }
 
 #[tokio::test]
+async fn socks5_udp_associate_crosses_overlay_and_releases_resources() {
+    let (a, b) = setup_data_plane_pair().await;
+    let remote = b
+        .gateway
+        .data_plane_udp_bind(0, Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::gateway::socks5::exercise_overlay_udp(a.gateway.clone(), &remote),
+    )
+    .await
+    .expect("SOCKS UDP integration test timed out");
+    assert_eq!(a.gateway.entries.count(), 0);
+    assert_eq!(a.gateway.host.udp_binds.load(Ordering::Relaxed), 0);
+    assert_eq!(b.gateway.host.udp_binds.load(Ordering::Relaxed), 0);
+    drop(remote);
+    assert_eq!(b.gateway.entries.count(), 0);
+    stop_data_plane_pair(&a, &b).await;
+}
+
+#[tokio::test]
 async fn data_plane_udp_carries_maximum_ipv4_payload() {
     let (a, b) = setup_data_plane_pair().await;
     let timeout = Duration::from_secs(10);

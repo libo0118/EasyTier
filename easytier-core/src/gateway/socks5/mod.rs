@@ -11,3 +11,6 @@ pub(crate) use adapter::Socks5GatewayAdapter;
 pub(crate) use codec::{Result, SocksError};
 pub(crate) use host::HostSocks5ServerRuntime;
 pub(crate) use server::{AcceptAuthentication, AsyncTcpConnector, Config, Socks5Socket};
+
+#[cfg(test)]
+pub(crate) use host::tests::exercise_overlay_udp;

@@ -64,7 +64,7 @@ where
     }
 }
 
-fn map_data_plane_error(error: DataPlaneError) -> SocksError {
+pub(super) fn map_data_plane_error(error: DataPlaneError) -> SocksError {
     match error.kind() {
         DataPlaneErrorKind::DeadlineExceeded => ReplyError::ConnectionTimeout.into(),
         DataPlaneErrorKind::ConnectionRefused => ReplyError::ConnectionRefused.into(),
@@ -96,12 +96,22 @@ async fn handle_socks5_stream<H, S>(
     config.set_request_timeout(10);
     config.set_skip_auth(false);
     config.set_allow_no_auth(true);
+    config.set_allow_udp(true);
+
+    let local_addr = match stream.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            tracing::error!(?error, "cannot obtain SOCKS5 listener address");
+            return;
+        }
+    };
 
     let connector = Socks5DataPlaneConnector {
         data_plane,
         source_addr,
     };
-    let socket = Socks5Socket::new(stream, Arc::new(config), connector, command_runtime);
+    let socket = Socks5Socket::new(stream, Arc::new(config), connector, command_runtime)
+        .with_udp_context(local_addr, source_addr);
     if let Err(error) = socket.upgrade_to_socks5().await {
         tracing::error!(?error, "SOCKS5 session failed");
     }
@@ -137,10 +147,15 @@ where
             operation: Mutex::new(()),
             started: AtomicBool::new(false),
             runtime_config,
-            data_plane,
+            data_plane: data_plane.clone(),
             host: host.clone(),
             socket_context: socket_context.clone(),
-            command_runtime: Arc::new(HostSocks5ServerRuntime::new(host, dns, socket_context)),
+            command_runtime: Arc::new(HostSocks5ServerRuntime::new(
+                host,
+                dns,
+                socket_context,
+                data_plane,
+            )),
             consumer_lease: Mutex::new(None),
             tasks: Arc::new(std::sync::Mutex::new(JoinSet::new())),
         })

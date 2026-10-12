@@ -102,6 +102,11 @@ impl<A: Authentication> Config<A> {
         self.allow_no_auth = value;
         self
     }
+
+    pub fn set_allow_udp(&mut self, value: bool) -> &mut Self {
+        self.allow_udp = value;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -122,7 +127,11 @@ pub(crate) trait Socks5UdpAssociation: Send {
 pub(crate) trait Socks5ServerRuntime: Send + Sync {
     async fn resolve_dns(&self, target_addr: TargetAddr) -> Result<TargetAddr>;
 
-    async fn bind_udp_association(&self) -> Result<Box<dyn Socks5UdpAssociation>>;
+    async fn bind_udp_association(
+        &self,
+        local_ip: IpAddr,
+        client_addr: SocketAddr,
+    ) -> Result<Box<dyn Socks5UdpAssociation>>;
 }
 
 /// Wrap TcpStream and contains Socks5 protocol implementation.
@@ -135,8 +144,7 @@ pub(crate) struct Socks5Socket<
     config: Arc<Config<A>>,
     target_addr: Option<TargetAddr>,
     cmd: Option<Socks5Command>,
-    /// Socket address which will be used in the reply message.
-    reply_ip: Option<IpAddr>,
+    udp_context: Option<(SocketAddr, SocketAddr)>,
     tcp_connector: C,
     runtime: Arc<dyn Socks5ServerRuntime>,
 }
@@ -155,10 +163,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication, C: AsyncTcpConnector>
             config,
             target_addr: None,
             cmd: None,
-            reply_ip: None,
+            udp_context: None,
             tcp_connector,
             runtime,
         }
+    }
+
+    pub fn with_udp_context(mut self, mut local_addr: SocketAddr, mut peer_addr: SocketAddr) -> Self {
+        local_addr.set_ip(local_addr.ip().to_canonical());
+        peer_addr.set_ip(peer_addr.ip().to_canonical());
+        self.udp_context = Some((local_addr, peer_addr));
+        self
     }
 
     /// Process clients SOCKS requests
@@ -465,6 +480,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication, C: AsyncTcpConnector>
             return Err(SocksError::UnsupportedSocksVersion(version));
         }
 
+        if rsv != 0 {
+            return Err(ReplyError::GeneralFailure.into());
+        }
+
         match Socks5Command::from_u8(cmd) {
             None => return Err(ReplyError::CommandNotSupported.into()),
             Some(cmd) => match cmd {
@@ -570,36 +589,40 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication, C: AsyncTcpConnector>
     /// Bind to a random UDP port, wait for the traffic from
     /// the client, and then forward the data to the remote addr.
     async fn execute_command_udp_assoc(&mut self) -> Result<()> {
-        // The DST.ADDR and DST.PORT fields contain the address and port that
-        // the client expects to use to send UDP datagrams on for the
-        // association. The server MAY use this information to limit access
-        // to the association.
-        // @see Page 6, https://datatracker.ietf.org/doc/html/rfc1928.
-        //
-        // We do NOT limit the access from the client currently in this implementation.
-        let _not_used = self.target_addr.as_ref();
+        let (local_addr, peer_addr) = self.udp_context.context("missing UDP control addresses")?;
+        let requested = match self.target_addr.as_ref() {
+            Some(TargetAddr::Ip(address)) => *address,
+            _ => return Err(ReplyError::AddressTypeNotSupported.into()),
+        };
+        let requested_ip = requested.ip().to_canonical();
+        if !requested_ip.is_unspecified() && requested_ip != peer_addr.ip() {
+            return Err(ReplyError::ConnectionNotAllowed.into());
+        }
+        let client_addr = SocketAddr::new(peer_addr.ip(), requested.port());
+        let association = self
+            .runtime
+            .bind_udp_association(local_addr.ip(), client_addr)
+            .await?;
 
-        // Listen with UDP6 socket, so the client can connect to it with either
-        // IPv4 or IPv6.
-        let association = self.runtime.bind_udp_association().await?;
-
-        // Respect the pre-populated reply IP address.
         self.inner
-            .write(&new_reply(
+            .write_all(&new_reply(
                 &ReplyError::Succeeded,
-                SocketAddr::new(
-                    self.reply_ip.context("invalid reply ip")?,
-                    association.local_addr()?.port(),
-                ),
+                association.local_addr()?,
             ))
             .await
             .context("Can't write successful reply")?;
+        self.inner.flush().await.context("Can't flush the reply!")?;
 
         debug!("Wrote success");
 
-        association.transfer().await?;
-
-        Ok(())
+        let mut control = [0u8; 1];
+        tokio::select! {
+            result = association.transfer() => result,
+            result = self.inner.read(&mut control) => {
+                result?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -761,7 +784,11 @@ mod tests {
             Ok(target_addr)
         }
 
-        async fn bind_udp_association(&self) -> Result<Box<dyn Socks5UdpAssociation>> {
+        async fn bind_udp_association(
+            &self,
+            _local_ip: IpAddr,
+            _client_addr: SocketAddr,
+        ) -> Result<Box<dyn Socks5UdpAssociation>> {
             Err(SocksError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "UDP is not used by this test runtime",
@@ -815,6 +842,48 @@ mod tests {
         drop(client_stream);
         drop(destination_stream);
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn udp_associate_rejects_invalid_control_requests() {
+        for (reserved, requested_ip, expected_reply) in
+            [(0, [127, 0, 0, 2], 2), (1, [0, 0, 0, 0], 1)]
+        {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                let (server_stream, mut client_stream) = tokio::io::duplex(128);
+                let (outbound, _destination_stream) = tokio::io::duplex(128);
+                let mut config = Config::<AcceptAuthentication>::default();
+                config.set_allow_no_auth(true).set_allow_udp(true);
+                let socket = Socks5Socket::new(
+                    server_stream,
+                    Arc::new(config),
+                    connector(outbound),
+                    Arc::new(TestRuntime),
+                )
+                .with_udp_context(
+                    "127.0.0.1:21000".parse().unwrap(),
+                    "127.0.0.1:31000".parse().unwrap(),
+                );
+                let task = tokio::spawn(socket.upgrade_to_socks5());
+                client_stream.write_all(&[5, 1, 0]).await.unwrap();
+                let mut method = [0; 2];
+                client_stream.read_exact(&mut method).await.unwrap();
+                assert_eq!(method, [5, 0]);
+                let mut request = vec![5, 3, reserved, 1];
+                request.extend_from_slice(&requested_ip);
+                request.extend_from_slice(&[0, 0]);
+                client_stream.write_all(&request).await.unwrap();
+                let mut reply = [0; 10];
+                client_stream.read_exact(&mut reply).await.unwrap();
+                assert_eq!(reply, [5, expected_reply, 0, 1, 0, 0, 0, 0, 0, 0]);
+                assert!(matches!(
+                    task.await.unwrap().err().expect("request must be rejected"),
+                    SocksError::ReplyError(_)
+                ));
+            })
+            .await
+            .expect("invalid UDP control request did not finish");
+        }
     }
 
     #[tokio::test]
