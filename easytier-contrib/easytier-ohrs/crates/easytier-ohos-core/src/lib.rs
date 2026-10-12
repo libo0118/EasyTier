@@ -1,3 +1,4 @@
+pub mod embedded;
 pub mod protocol;
 pub mod routing;
 pub mod runtime;

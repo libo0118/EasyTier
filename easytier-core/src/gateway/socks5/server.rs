@@ -169,7 +169,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication, C: AsyncTcpConnector>
         }
     }
 
-    pub fn with_udp_context(mut self, mut local_addr: SocketAddr, mut peer_addr: SocketAddr) -> Self {
+    pub fn with_udp_context(
+        mut self,
+        mut local_addr: SocketAddr,
+        mut peer_addr: SocketAddr,
+    ) -> Self {
         local_addr.set_ip(local_addr.ip().to_canonical());
         peer_addr.set_ip(peer_addr.ip().to_canonical());
         self.udp_context = Some((local_addr, peer_addr));

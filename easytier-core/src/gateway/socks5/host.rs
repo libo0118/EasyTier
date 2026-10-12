@@ -322,7 +322,10 @@ pub(super) mod tests {
             server_stream,
             Arc::new(config),
             UnusedConnector,
-            Arc::new(TestRuntime { inbound, data_plane }),
+            Arc::new(TestRuntime {
+                inbound,
+                data_plane,
+            }),
         )
         .with_udp_context(
             "[::ffff:127.0.0.1]:21000".parse().unwrap(),
@@ -427,24 +430,20 @@ pub(super) mod tests {
             let mut overlay_port = 0;
             for payload in [b"ping", b"next"] {
                 let mut buffer = [0; 64];
-                let (size, overlay_source) = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    remote.recv_from(&mut buffer),
-                )
-                .await
-                .expect("SOCKS datagram did not cross the overlay")
-                .unwrap();
+                let (size, overlay_source) =
+                    tokio::time::timeout(Duration::from_secs(10), remote.recv_from(&mut buffer))
+                        .await
+                        .expect("SOCKS datagram did not cross the overlay")
+                        .unwrap();
                 assert_eq!(&buffer[..size], payload);
                 assert_ne!(overlay_source.ip(), client.ip());
                 overlay_port = overlay_source.port();
                 remote.send_to(b"pong", overlay_source).await.unwrap();
-                let (response, response_client) = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    responses.recv(),
-                )
-                .await
-                .unwrap()
-                .unwrap();
+                let (response, response_client) =
+                    tokio::time::timeout(Duration::from_secs(10), responses.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
                 assert_eq!(response_client, client);
                 assert_eq!(
                     response[3],
