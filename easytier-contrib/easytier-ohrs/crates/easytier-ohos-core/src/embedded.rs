@@ -3,6 +3,31 @@ use easytier::proto::api::manage::{NetworkConfig, NetworkingMethod};
 
 pub const EMBEDDED_INSTANCE_ID: &str = "9d9ccb7f-71e5-4cb8-9fb1-a18d0845d6a0";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Standalone,
+    Embedded,
+}
+
+impl RuntimeMode {
+    pub fn start_network_instance(
+        self,
+        start_local_socket: impl FnOnce() -> bool,
+        start_management_server: impl FnOnce() -> bool,
+        start_instance: impl FnOnce() -> bool,
+    ) -> bool {
+        // Embedded hosts use N-API directly; the independent app's IPC sockets are unnecessary.
+        if self == Self::Standalone && (!start_local_socket() || !start_management_server()) {
+            return false;
+        }
+        start_instance()
+    }
+
+    pub fn run_standalone_service(self, operation: impl FnOnce() -> bool) -> bool {
+        self == Self::Standalone && operation()
+    }
+}
+
 pub fn is_config_server_config(config: &NetworkConfig) -> bool {
     matches!(
         NetworkingMethod::try_from(config.networking_method.unwrap_or_default())
@@ -43,6 +68,82 @@ pub fn embedded_network_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn embedded_start_skips_denied_ipc_and_preserves_instance_result() {
+        for started in [true, false] {
+            let calls = RefCell::new(Vec::new());
+            assert_eq!(
+                RuntimeMode::Embedded.start_network_instance(
+                    || {
+                        calls.borrow_mut().push("local_socket");
+                        false
+                    },
+                    || {
+                        calls.borrow_mut().push("management");
+                        false
+                    },
+                    || {
+                        calls.borrow_mut().push("instance");
+                        started
+                    },
+                ),
+                started,
+            );
+            assert_eq!(*calls.borrow(), vec!["instance"]);
+        }
+    }
+
+    #[test]
+    fn standalone_start_preserves_ipc_order_and_short_circuits_failures() {
+        for (local_ok, management_ok, instance_ok, expected) in [
+            (false, true, true, vec!["local_socket"]),
+            (true, false, true, vec!["local_socket", "management"]),
+            (true, true, false, vec!["local_socket", "management", "instance"]),
+            (true, true, true, vec!["local_socket", "management", "instance"]),
+        ] {
+            let calls = RefCell::new(Vec::new());
+            assert_eq!(
+                RuntimeMode::Standalone.start_network_instance(
+                    || {
+                        calls.borrow_mut().push("local_socket");
+                        local_ok
+                    },
+                    || {
+                        calls.borrow_mut().push("management");
+                        management_ok
+                    },
+                    || {
+                        calls.borrow_mut().push("instance");
+                        instance_ok
+                    },
+                ),
+                local_ok && management_ok && instance_ok,
+            );
+            assert_eq!(*calls.borrow(), expected);
+        }
+    }
+
+    #[test]
+    fn embedded_cleanup_and_restart_skip_standalone_services() {
+        for service in ["web_client", "stop_local_socket", "restart_local_socket", "cleanup"] {
+            assert!(!RuntimeMode::Embedded.run_standalone_service(|| {
+                panic!("embedded lifecycle must not call {service}")
+            }));
+        }
+        for result in [true, false] {
+            let calls = RefCell::new(0);
+            assert_eq!(
+                RuntimeMode::Standalone.run_standalone_service(|| {
+                    *calls.borrow_mut() += 1;
+                    result
+                }),
+                result,
+            );
+            assert_eq!(*calls.borrow(), 1);
+        }
+    }
 
     #[test]
     fn embedded_config_forces_loopback_socks_no_tun_and_no_listeners() {

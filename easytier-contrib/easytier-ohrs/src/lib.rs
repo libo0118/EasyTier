@@ -48,7 +48,7 @@ use easytier::common::{
 use easytier::proto::api::manage::NetworkConfig;
 use easytier::web_client::{WebClient, WebClientHooks, run_web_client};
 use easytier_ohos_core::embedded::{
-    EMBEDDED_INSTANCE_ID, embedded_network_config, is_config_server_config,
+    EMBEDDED_INSTANCE_ID, RuntimeMode, embedded_network_config, is_config_server_config,
 };
 use easytier_ohos_core::runtime;
 use easytier_ohos_core::{ASYNC_RUNTIME, INSTANCE_MANAGER};
@@ -690,16 +690,16 @@ pub(crate) fn run_network_instance_from_json(cfg_json: &str) -> bool {
         }
     };
 
-    run_local_network_instance(config, cfg)
+    run_local_network_instance(config, cfg, RuntimeMode::Standalone)
 }
 
-fn run_local_network_instance(config: NetworkConfig, cfg: TomlConfigLoader) -> bool {
+fn run_local_network_instance(
+    config: NetworkConfig,
+    cfg: TomlConfigLoader,
+    mode: RuntimeMode,
+) -> bool {
     if !INSTANCE_MANAGER.instance_ids().is_empty() {
         ohrs_log_error!("[Rust] there is a running instance!");
-        return false;
-    }
-
-    if !ensure_local_socket_server_started() {
         return false;
     }
 
@@ -709,21 +709,28 @@ fn run_local_network_instance(config: NetworkConfig, cfg: TomlConfigLoader) -> b
         return false;
     }
 
-    let config_control = nearby_management::runtime_management_config_control(inst_id);
-    if !nearby_management::ensure_runtime_management_server_started() {
-        return false;
+    if mode == RuntimeMode::Embedded {
+        ohrs_log_info!(
+            "[Rust] embedded runtime uses direct N-API; standalone local IPC disabled"
+        );
     }
-
-    match INSTANCE_MANAGER.run_network_instance(cfg, config_control) {
-        Ok(_) => {
-            cache_runtime_config_snapshot(inst_id.to_string(), inst_id.to_string(), config);
-            true
-        }
-        Err(err) => {
-            ohrs_log_error!("[Rust] start_kernel failed for {}: {}", inst_id, err);
-            false
-        }
-    }
+    mode.start_network_instance(
+        ensure_local_socket_server_started,
+        nearby_management::ensure_runtime_management_server_started,
+        || {
+            let config_control = nearby_management::runtime_management_config_control(inst_id);
+            match INSTANCE_MANAGER.run_network_instance(cfg, config_control) {
+                Ok(_) => {
+                    cache_runtime_config_snapshot(inst_id.to_string(), inst_id.to_string(), config);
+                    true
+                }
+                Err(err) => {
+                    ohrs_log_error!("[Rust] start_kernel failed for {}: {}", inst_id, err);
+                    false
+                }
+            }
+        },
+    )
 }
 
 fn start_kernel_with_config_id(config_id: &str) -> bool {
@@ -845,8 +852,13 @@ pub fn start_kernel(config_id: String) -> bool {
 
 #[napi]
 pub fn stop_kernel(config_id: String) -> bool {
+    stop_kernel_in_mode(config_id, RuntimeMode::Standalone)
+}
+
+fn stop_kernel_in_mode(config_id: String, mode: RuntimeMode) -> bool {
     exports::runtime_api::stop_kernel(
         config_id,
+        mode,
         stop_web_client,
         parse_instance_uuid,
         maybe_stop_local_socket_server,
@@ -969,11 +981,11 @@ pub fn run_embedded_network_instance(cfg_json: String, socks5_port: u32) -> bool
         }
     };
     if INSTANCE_MANAGER.instance_ids().contains(&cfg.get_id())
-        && !stop_kernel(EMBEDDED_INSTANCE_ID.to_string())
+        && !stop_kernel_in_mode(EMBEDDED_INSTANCE_ID.to_string(), RuntimeMode::Embedded)
     {
         return false;
     }
-    run_local_network_instance(config, cfg)
+    run_local_network_instance(config, cfg, RuntimeMode::Embedded)
 }
 
 #[napi(js_name = "stopEmbeddedNetworkInstance")]
@@ -981,7 +993,7 @@ pub fn stop_embedded_network_instance() -> bool {
     let Ok(_guard) = EMBEDDED_RUNTIME_LOCK.lock() else {
         return false;
     };
-    stop_kernel(EMBEDDED_INSTANCE_ID.to_string())
+    stop_kernel_in_mode(EMBEDDED_INSTANCE_ID.to_string(), RuntimeMode::Embedded)
 }
 
 /// Starts the management server in the VPN Extension process even when no

@@ -10,6 +10,7 @@ use crate::runtime::state::runtime_state::{
     runtime_instance_from_running_info,
 };
 use crate::{ASYNC_RUNTIME, INSTANCE_MANAGER, WEB_CLIENTS};
+use easytier_ohos_core::embedded::RuntimeMode;
 
 pub(crate) fn start_kernel(
     config_id: String,
@@ -20,17 +21,18 @@ pub(crate) fn start_kernel(
 
 pub(crate) fn stop_kernel(
     config_id: String,
+    mode: RuntimeMode,
     stop_web_client: impl Fn(&str) -> bool,
     parse_instance_uuid: impl Fn(&str) -> Option<uuid::Uuid>,
     maybe_stop_local_socket_server: impl Fn(),
 ) -> bool {
     clear_tun_attached(&config_id);
-    if stop_web_client(&config_id) {
+    if mode.run_standalone_service(|| stop_web_client(&config_id)) {
         clear_runtime_config_snapshot(&config_id);
         return true;
     }
 
-    let _ = stop_local_socket_server_inner();
+    let _ = mode.run_standalone_service(stop_local_socket_server_inner);
 
     let Some(instance_id) = parse_instance_uuid(&config_id) else {
         return false;
@@ -46,15 +48,18 @@ pub(crate) fn stop_kernel(
     if ret {
         clear_runtime_config_snapshot(&config_id);
     }
-    let has_active_instances = !INSTANCE_MANAGER.instance_ids().is_empty();
-    let has_web_clients = WEB_CLIENTS
-        .lock()
-        .map(|guard| !guard.is_empty())
-        .unwrap_or(false);
-    if has_active_instances || has_web_clients {
-        let _ = start_local_socket_server_inner();
-    }
-    maybe_stop_local_socket_server();
+    let _ = mode.run_standalone_service(|| {
+        let has_active_instances = !INSTANCE_MANAGER.instance_ids().is_empty();
+        let has_web_clients = WEB_CLIENTS
+            .lock()
+            .map(|guard| !guard.is_empty())
+            .unwrap_or(false);
+        if has_active_instances || has_web_clients {
+            let _ = start_local_socket_server_inner();
+        }
+        maybe_stop_local_socket_server();
+        true
+    });
     ret
 }
 
